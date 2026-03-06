@@ -259,15 +259,15 @@ class EnhancedFraudDetectionAnalyzer:
         rv = self.results.get("velocity_violations", {})
         dv = rv.get("daily_violations", pd.DataFrame())
         if dv is not None and len(dv):
-            for card, row in dv.iterrows():
+            for _, row in dv.iterrows():
                 cases.append({
                     "alert_type":   "velocity",
                     "severity":     "medium",
-                    "entity_type":  "card",
-                    "entity_value": str(card),
+                    "entity_type":  str(row.get("Entity_Type", "entity")),
+                    "entity_value": str(row.get("Entity_Value", "")),
                     "amount_usd":   0,
-                    "tx_count":     int(row.get("max", 0) or 0),
-                    "details": {"violation_days": int(row.get("count", 0) or 0)},
+                    "tx_count":     int(row.get("Max_Transactions_24h", 0) or 0),
+                    "details": {"violation_days": int(row.get("Violation_Days", 0) or 0)},
                 })
 
         # Blocked countries - ALWAYS CRITICAL
@@ -285,18 +285,15 @@ class EnhancedFraudDetectionAnalyzer:
                     "details": {"country": str(row.get("BIN country", row.get("Country", "")))},
                 })
 
-        # 3DS anomaly – high value non-3D
+        # 3DS enforcement - no approved non-3DS transactions allowed
         r3 = self.results.get("secure_3d_analysis", {})
-        high_non3d = r3.get("high_value_non_3d", pd.DataFrame())
-        if high_non3d is not None and len(high_non3d):
-            for _, row in high_non3d.iterrows():
+        non3d_approved = r3.get("non_3d_approved", pd.DataFrame())
+        if non3d_approved is not None and len(non3d_approved):
+            for _, row in non3d_approved.iterrows():
                 amount = float(row.get("Amount", 0) or 0)
-                # Only include high-value non-3D ($500+)
-                if amount < 500:
-                    continue
                 cases.append({
-                    "alert_type":   "3ds_anomaly",
-                    "severity":     score_severity(amount, 1, is_payout_only=False),
+                    "alert_type":   "3ds_required",
+                    "severity":     "critical",
                     "entity_type":  "card",
                     "entity_value": str(row.get("Card No", row.get("Txid", ""))),
                     "amount_usd":   amount,
@@ -407,10 +404,19 @@ class EnhancedFraudDetectionAnalyzer:
                 phone_payins = payins[payins["Phone"]==phone]
                 if len(phone_payins) == 0:
                     phone_payouts = payouts[payouts["Phone"]==phone]
+                    payout_days = 0
+                    if "Created Date (Server TZ)" in phone_payouts.columns:
+                        payout_days = pd.to_datetime(
+                            phone_payouts["Created Date (Server TZ)"], errors="coerce"
+                        ).dt.date.nunique()
+                    # Rule: payout-only must span at least 2 distinct days
+                    if payout_days < 2:
+                        continue
                     payout_only.append({
                         "Phone": phone,
                         "Payout_Amount": phone_payouts["Amount"].sum() if "Amount" in phone_payouts.columns else 0,
                         "Payout_Count":  len(phone_payouts),
+                        "Payout_Days": payout_days,
                         "Total_Emails_Used": phone_payouts["Email"].nunique() if "Email" in phone_payouts.columns else 0,
                         "First_Payout": phone_payouts["Created Date (Server TZ)"].min() if "Created Date (Server TZ)" in phone_payouts.columns else None,
                         "Last_Payout":  phone_payouts["Created Date (Server TZ)"].max() if "Created Date (Server TZ)" in phone_payouts.columns else None,
@@ -479,10 +485,19 @@ class EnhancedFraudDetectionAnalyzer:
                 email_payins = payins[payins["Email"]==email]
                 if len(email_payins) == 0:
                     ep = payouts[payouts["Email"]==email]
+                    payout_days = 0
+                    if "Created Date (Server TZ)" in ep.columns:
+                        payout_days = pd.to_datetime(
+                            ep["Created Date (Server TZ)"], errors="coerce"
+                        ).dt.date.nunique()
+                    # Rule: payout-only must span at least 2 distinct days
+                    if payout_days < 2:
+                        continue
                     payout_only.append({
                         "Email":          email,
                         "Payout_Amount":  ep["Amount"].sum() if "Amount" in ep.columns else 0,
                         "Payout_Count":   len(ep),
+                        "Payout_Days":    payout_days,
                         "Total_Cards_Used":  ep["Card No"].nunique() if "Card No" in ep.columns else 0,
                         "Total_Phones_Used": ep["Phone"].nunique() if "Phone" in ep.columns else 0,
                     })
@@ -516,11 +531,19 @@ class EnhancedFraudDetectionAnalyzer:
                 entity_payins = payins[payins[col]==entity]
                 if len(entity_payins) == 0:
                     ep = payouts[payouts[col]==entity]
+                    payout_days = 0
+                    if "Created Date (Server TZ)" in ep.columns:
+                        payout_days = pd.to_datetime(
+                            ep["Created Date (Server TZ)"], errors="coerce"
+                        ).dt.date.nunique()
+                    if payout_days < 2:
+                        continue
                     payout_only_entities.append({
                         "Entity_Type":  col,
                         "Entity":       entity,
                         "Payout_Amount": ep["Amount"].sum() if "Amount" in ep.columns else 0,
                         "Payout_Count": len(ep),
+                        "Payout_Days": payout_days,
                     })
 
         payout_df = pd.DataFrame(payout_only_entities).sort_values("Payout_Amount", ascending=False) if payout_only_entities else pd.DataFrame()
@@ -601,28 +624,76 @@ class EnhancedFraudDetectionAnalyzer:
             "suspicious_recurring": suspicious,
         }
 
-    def _velocity_rule_analysis(self, daily_limit=10, hourly_limit=5):
-        if self.card_df is None or "Card No" not in self.card_df.columns:
+    def _velocity_rule_analysis(self, daily_limit=7, hourly_limit=5):
+        datasets = []
+
+        if self.card_df is not None and "Created Date (Server TZ)" in self.card_df.columns:
+            c = self.card_df.copy()
+            if "Card No" in c.columns:
+                c["Entity_Type"] = "card"
+                c["Entity_Value"] = c["Card No"].astype(str)
+                datasets.append(c[["Entity_Type", "Entity_Value", "Created Date (Server TZ)"]])
+            if "Email" in c.columns:
+                ce = c[c["Email"].notna()].copy()
+                if len(ce):
+                    ce["Entity_Type"] = "email"
+                    ce["Entity_Value"] = ce["Email"].astype(str)
+                    datasets.append(ce[["Entity_Type", "Entity_Value", "Created Date (Server TZ)"]])
+
+        if self.apm_df is not None and "Created Date (Server TZ)" in self.apm_df.columns:
+            a = self.apm_df.copy()
+            if "Phone" in a.columns:
+                ap = a[a["Phone"].notna()].copy()
+                if len(ap):
+                    ap["Entity_Type"] = "phone"
+                    ap["Entity_Value"] = ap["Phone"].astype(str)
+                    datasets.append(ap[["Entity_Type", "Entity_Value", "Created Date (Server TZ)"]])
+            if "Email" in a.columns:
+                ae = a[a["Email"].notna()].copy()
+                if len(ae):
+                    ae["Entity_Type"] = "email"
+                    ae["Entity_Value"] = ae["Email"].astype(str)
+                    datasets.append(ae[["Entity_Type", "Entity_Value", "Created Date (Server TZ)"]])
+
+        if not datasets:
             return
-        if "Created Date (Server TZ)" not in self.card_df.columns:
+
+        vd = pd.concat(datasets, ignore_index=True)
+        vd["Date"] = pd.to_datetime(vd["Created Date (Server TZ)"], errors="coerce").dt.date
+        vd = vd[vd["Date"].notna()]
+        if len(vd) == 0:
             return
-        vd = self.card_df.copy()
-        vd["Date"] = pd.to_datetime(vd["Created Date (Server TZ)"]).dt.date
-        vd["Hour"] = pd.to_datetime(vd["Created Date (Server TZ)"]).dt.floor("h")
 
-        daily  = vd.groupby(["Card No","Date"]).size()
-        hourly = vd.groupby(["Card No","Hour"]).size()
-        daily_v  = daily[daily > daily_limit]
-        hourly_v = hourly[hourly > hourly_limit]
+        daily = vd.groupby(["Entity_Type", "Entity_Value", "Date"]).size().reset_index(name="Tx_Count_24h")
+        daily_v = daily[daily["Tx_Count_24h"] > daily_limit]
 
-        cards_daily  = daily_v.groupby("Card No").agg(["count","max","mean"]).round(2) if len(daily_v) else pd.DataFrame()
-        cards_hourly = hourly_v.groupby("Card No").agg(["count","max","mean"]).round(2) if len(hourly_v) else pd.DataFrame()
+        if len(daily_v):
+            summary = (
+                daily_v.groupby(["Entity_Type", "Entity_Value"])["Tx_Count_24h"]
+                .agg(["count", "max", "mean"])
+                .reset_index()
+                .rename(
+                    columns={
+                        "count": "Violation_Days",
+                        "max": "Max_Transactions_24h",
+                        "mean": "Avg_Transactions_24h",
+                        "Entity_Type": "Entity_Type",
+                        "Entity_Value": "Entity_Value",
+                    }
+                )
+            )
+            summary["Avg_Transactions_24h"] = summary["Avg_Transactions_24h"].round(2)
+        else:
+            summary = pd.DataFrame(
+                columns=["Entity_Type", "Entity_Value", "Violation_Days", "Max_Transactions_24h", "Avg_Transactions_24h"]
+            )
 
+        # Keep hourly key for backward compatibility in downstream summary/UI code.
         self.results["velocity_violations"] = {
-            "daily_violations":  cards_daily,
-            "hourly_violations": cards_hourly,
+            "daily_violations": summary,
+            "hourly_violations": pd.DataFrame(),
         }
-        self._log("success", f"Velocity: {len(cards_daily)} daily, {len(cards_hourly)} hourly violators")
+        self._log("success", f"Velocity (>{daily_limit}/24h): {len(summary)} entities")
 
     def _suspicious_timing_analysis(self):
         datasets = []
@@ -778,11 +849,16 @@ class EnhancedFraudDetectionAnalyzer:
             {"Amount": ["count","sum","mean"]} if "Amount" in src.columns else {"Txid": "count"}
         ).round(2)
 
-        non3d = src[src["Is 3D"]=="No"]
-        high_non3d = pd.DataFrame()
-        if len(non3d) and "Amount" in non3d.columns:
-            threshold = non3d["Amount"].quantile(0.9)
-            high_non3d = non3d[non3d["Amount"]>threshold].sort_values("Amount", ascending=False)
+        non3d = src[src["Is 3D"].astype(str).str.strip().str.lower()=="no"]
+        non3d_approved = pd.DataFrame()
+        if len(non3d):
+            if "Status" in non3d.columns:
+                non3d_approved = non3d[non3d["Status"].astype(str).str.strip().str.lower()=="approved"].copy()
+            else:
+                non3d_approved = non3d.copy()
+
+        if len(non3d_approved) and "Amount" in non3d_approved.columns:
+            non3d_approved = non3d_approved.sort_values("Amount", ascending=False)
 
         # Merchant 3D breakdown
         merchant_3d = pd.DataFrame()
@@ -796,7 +872,8 @@ class EnhancedFraudDetectionAnalyzer:
         self.results["secure_3d_analysis"] = {
             "overall_stats":    stats,
             "merchant_3d":      merchant_3d,
-            "high_value_non_3d": high_non3d.head(20) if len(high_non3d) else pd.DataFrame(),
+            "high_value_non_3d": non3d_approved.head(20) if len(non3d_approved) else pd.DataFrame(),
+            "non_3d_approved": non3d_approved,
         }
 
     # ── Summary stats for session ─────────────────────────────────

@@ -49,7 +49,12 @@ with st.sidebar:
     render_sidebar()
     st.divider()
     st.markdown("**Active Rules**")
-    for rule in ["Sanctions Match","Velocity (>3 in 24h)","Payout-Only (90d)","3DS Anomaly >$500"]:
+    for rule in [
+        "Sanctions Match",
+        "Velocity: >7 txns in 24h (Phone/Email/Card)",
+        "Payout-Only: >=2 days",
+        "3DS Required: no approved non-3DS",
+    ]:
         st.markdown(f'<span class="rule-badge">✅ {rule}</span>', unsafe_allow_html=True)
 
 # ── File uploaders ────────────────────────────────────────────────
