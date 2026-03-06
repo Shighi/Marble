@@ -14,9 +14,14 @@ from sqlalchemy.exc import SQLAlchemyError
 from dotenv import load_dotenv
 
 
-# Load project-level .env when running app directly on host.
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
+# Resolve paths for both local dev and hosted runtimes (e.g., Render).
+_CORE_DIR = os.path.abspath(os.path.dirname(__file__))
+_APP_ROOT = os.path.abspath(os.path.join(_CORE_DIR, ".."))
+_REPO_ROOT = os.path.abspath(os.path.join(_CORE_DIR, "..", ".."))
+
+# Load .env if present (local dev). Safe no-op in hosted env.
+load_dotenv(os.path.join(_APP_ROOT, ".env"))
+load_dotenv(os.path.join(_REPO_ROOT, ".env"))
 
 # ── Connection ────────────────────────────────────────────────────
 _db_user = os.getenv("POSTGRES_USER", "sentinel")
@@ -32,8 +37,12 @@ DATABASE_URL = os.getenv(
 
 
 def _ensure_schema(engine):
-    schema_path = os.path.join(_PROJECT_ROOT, "streamlit_app", "schema.sql")
-    if not os.path.exists(schema_path):
+    schema_candidates = [
+        os.path.join(_APP_ROOT, "schema.sql"),                  # hosted rootDir=streamlit_app
+        os.path.join(_REPO_ROOT, "streamlit_app", "schema.sql"),# local repo root
+    ]
+    schema_path = next((p for p in schema_candidates if os.path.exists(p)), None)
+    if schema_path is None:
         return
 
     with open(schema_path, "r", encoding="utf-8") as f:
