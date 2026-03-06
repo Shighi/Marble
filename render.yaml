@@ -1,11 +1,8 @@
-services:
-  - type: pserv
-    name: sentinel-db
+databases:
+  - name: sentinel-db
     plan: free
-    disk:
-      name: sentinel-db-data
-      sizeGB: 1
 
+services:
   - type: web
     name: sentinel-app
     env: docker
